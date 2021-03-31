@@ -1,0 +1,246 @@
+; 
+; Calculate pi on the Altair-Duino using the Leibniz formula
+; 
+; This series is known to converge quite slowly, but is relatively simple
+; to implement, requiring just addition, subtraction and division.
+; 
+; Result is pi * 1,000,000,000
+; 
+; Calculates about 60 terms per second
+; About 250,000 per hour
+; 
+            .ORG    0 
+            JMP     START 
+; 
+NUMBYTES    EQU     4 ; 4 byte values
+NUMBITS     EQU     NUMBYTES * 8 
+RESULT:     DB      0,0,0,0 
+DIVIDEND:   DB      0x00,0x09,0x3d,0x00 ; 2x size of values
+            DB      0x00,0x00,0x00,0x00 
+DIVISOR:    DB      0,0,0,0 
+NUMERATOR:  DB      0x00,0x28,0x6b,0xee ; 4,000,000,000 = 0xEE6B2800
+NUMERATOR2: DB      0,0,0,0 ; Always zeros, (numerator same size as dividend)
+DENOMINATOR: DB     0xff,0xff,0xff,0xff ; init: 0xff,0xff,0xff,0xff
+MINUS:      DB      0xff ; minus indicator, 0-plus, 0xFF (init value)
+ITERATIONS: DB      0x10,0xff,0xff,0xff ; Note: Counts up, stops at 0
+; 
+START:               
+            LXI     sp,0x0100 ; Keep everything inside first 256 bytes
+; 
+NEXT_TERM:           
+; 
+; --------------------------------------------------
+; Determine next term in sequence
+; --------------------------------------------------
+; 
+; Calculate next term values
+            CALL    CALC_TERM 
+; 
+; Load terms for division
+            MVI     c,NUMBYTES * 2 ; numerator is 2x bytes
+            LXI     d,NUMERATOR ; copy numerator
+            LXI     h,DIVIDEND ; to dividend
+COPY_NEXT:  LDAX    d 
+            MOV     m,a 
+            INR     e 
+            INR     l 
+            DCR     c 
+            JNZ     COPY_NEXT 
+; 
+; --------------------------------------------------
+; Division section
+; --------------------------------------------------
+; 
+; Definitions:
+; The dividend is the number being divided,
+; while the divisor is the number by which the dividend is divided.
+; Quotient is the result of the division.
+; 
+; dividend [DE] / divisor [LH]
+; 
+; Shift dividend
+            ORA     a ; clear carry
+            PUSH    psw ; push initial PSW
+            MVI     b,NUMBITS ; shift 8 * bytes
+DIV_LOOP:   MVI     c,NUMBYTES * 2 ; full calc register is 2x bytes
+            LXI     d,DIVIDEND 
+            POP     psw ; retrieve saved carry
+            CALL    SHIFT_LEFT ; shift dividend with carry
+; 
+; Do subtraction
+            LXI     d,DIVIDEND + NUMBYTES ; work with top 4 bytes of register
+            LXI     h,DENOMINATOR ; the divisor
+            CALL    SUBTRACT 
+            PUSH    psw ; save carry for next shift
+; 
+            CALL    SHOW_STATUS ; light front panel LEDs
+; 
+            DCR     b ; more bits?
+            JNZ     DIV_LOOP 
+; 
+; Division done
+; remainder in top half of DIVIDEND
+; quotient in lower half of DIVIDEND (after 1 more shift)
+            MVI     c,NUMBYTES ; shift lower bytes only
+            LXI     d,DIVIDEND 
+            CALL    SHIFT_LEFT 
+            POP     psw ; clean up stack
+; 
+; --------------------------------------------------
+; Update pi value
+; --------------------------------------------------
+; 
+; Update sum with quotient
+; DE - result
+; HL - quotient (held in lower half of dividend)
+; [MINUS] - indicator to add (=0) or subtract quotient (<>0)
+; 
+; Note: Remainder is truncated (no rounding)
+; 
+            MVI     c,NUMBYTES ; bytes to update
+            LXI     h,DIVIDEND ; add this to result
+            LXI     d,RESULT ; [DE] = [DE] + [HL]
+            ORA     a ; clear carry
+SUM1:       LDA     MINUS ; get sign
+            JC      SUM3 ; combine sign and carry
+            ORA     a ; test minus and clear carry
+            JMP     SUM4 
+SUM3:       ORA     a ; test minus and set carry
+            STC      
+SUM4:       LDAX    d ; load running sum
+            JZ      ADD_OP ; add or subtract
+            SBB     m ; subtract quotient
+            JMP     SUM2 
+ADD_OP:     ADC     m ; add quotient
+SUM2:       STAX    d ; update sum
+            INR     e 
+            INR     l 
+            DCR     c 
+            JNZ     SUM1 
+; 
+; --------------------------------------------------
+; Test for more iterations
+; --------------------------------------------------
+; 
+TEST_ITERATION:      
+            LXI     d,ITERATIONS ; iteration count
+            MVI     l,1 
+            CALL    INC_VALUE 
+; Test for final 64K terms
+            LDA     ITERATIONS + 2 ; test 3rd byte of counter, 0xnnFFnnnn
+            INR     a ; plus 1 should be zero
+            JNZ     TEST_ZERO 
+            EI       ; turn on interrupt enable LED as last 64K indicator
+; Test for zero result bug?
+;            LDA     RESULT + 3 ; high result byte should never be 0
+;            ORA     a ; test zero
+;            JNZ     TEST_ZERO
+;ZERO_ERROR: LDA     0xC300 ; error pattern for LEDs
+;            JMP     ZERO_ERROR
+; 
+TEST_ZERO:  MOV     a,b ; test if result is zero
+            ORA     a 
+            JNZ     NEXT_TERM 
+; 
+; --------------------------------------------------
+; End of calc
+; --------------------------------------------------
+; 
+; Indicate end by lighting LEDs
+            DI       ; turn off INTE LED
+END:        LDA     0xAA00 ; pattern "O.O.O.O."
+            JMP     END 
+; 
+; --------------------------------------------------
+; End main
+; --------------------------------------------------
+; 
+; Increment value
+; 
+; DE - value to increment
+; L - increment amount
+; 
+; Returns: B - result is zero = 0
+; 
+INC_VALUE:           
+            MOV     b,d ; B indicates if result is zero, init 0
+            MVI     c,NUMBYTES ; bytes to update
+            ORA     a ; clear carry
+INC1:       LDAX    d 
+            ADC     l ; increment value
+            STAX    d 
+            PUSH    psw ; save carry
+            ORA     b ; update zero result indicator
+            MOV     b,a 
+            POP     psw ; restore carry
+            MOV     l,d ; increment subsequent bytes by 0
+            INR     e 
+            DCR     c 
+            JNZ     INC1 
+            RET      
+
+; 
+; Calc next term
+; 
+; Alternate sign flag
+; Increment denominator by 2
+; 
+CALC_TERM:           
+            LDA     MINUS ; alternate sign
+            CMA      
+            STA     MINUS 
+            LXI     d,DENOMINATOR ; iteration count
+            MVI     l,2 ; increment by 2
+            CALL    INC_VALUE 
+            RET      
+; 
+; Shift dividend left with carry from previous calc
+; DE - dividend
+; 
+SHIFT_LEFT:          
+SHIFT2:     LDAX    d ; read byte
+            RAL      ; shift left
+            STAX    d ; save byte
+            INR     e ; next byte address
+            DCR     c 
+            JNZ     SHIFT2 
+            RET      
+; 
+; Subtract divisor from dividend
+; DE - dividend
+; HL - divisor
+; Return: carry flag
+;         remainder in dividend upper bytes (if carry)
+;         HL - dividend
+SUBTRACT:   MVI     c,NUMBYTES ; size of values
+            ORA     a ; clear carry (no borrow with 1st byte)
+SUB1:       LDAX    d ; get dividend byte
+            SBB     m ; subtract divisor byte with borrow
+            PUSH    psw ; save remainder
+            INR     e ; next bytes
+            INR     l 
+            DCR     c 
+            JNZ     SUB1 
+; load remainder back into dividend only if no carry
+            XCHG     ; want D register to access memory, so need the address in HL
+            MVI     c,NUMBYTES ; bytes in remainder
+SUB2:       DCR     l ; loading bytes from high to low
+            POP     d ; use D so carry not disturbed
+            JC      SUB4 ; only copy if no carry
+            MOV     m,d 
+SUB4:       DCR     c ; next byte
+            JNZ     SUB2 
+            CMC      ; carry indicates successful subtraction
+            RET      
+
+; 
+; Display current iteration in LEDs
+; Status of second byte of iterations (increments after each 256 terms)
+; 
+SHOW_STATUS:         
+            LDA     ITERATIONS + 1 ; get second least significant byte
+            MOV     d,a ; use as upper 8 bits of address
+            LDAX    d ; light address LEDs
+            LDAX    d 
+            LDAX    d 
+            RET      
